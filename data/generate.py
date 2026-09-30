@@ -249,7 +249,8 @@ def write(b: Builder, db_path: Path | None = None) -> dict[str, str]:
         conn.executemany("INSERT INTO pending_transfers(customer_id,created_at,amount,beneficiary,beneficiary_is_new,beneficiary_type) VALUES (?,?,?,?,?,?)", b.pending)
         conn.executemany("INSERT INTO appointment_slots(starts_at, advisor) VALUES (?, ?)", b.slots)
         for username, role, cid in b.users:
-            pwd = shared or secrets.token_urlsafe(9)
+            # Advisor accounts must never share the demo password to prevent privilege escalation
+            pwd = secrets.token_urlsafe(9) if role == "advisor" else (shared or secrets.token_urlsafe(9))
             creds[username] = pwd
             conn.execute("INSERT INTO users VALUES (?,?,?,?)", (username, hash_password(pwd), role, cid))
     return creds
