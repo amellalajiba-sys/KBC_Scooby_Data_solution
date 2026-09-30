@@ -112,32 +112,84 @@ def require_advisor(p: Principal = Depends(current_principal)) -> Principal:
 class LoginRateLimiter:
     """In-memory sliding window (enough for a single-instance PoC; Redis in production)."""
 
-    def __init__(self, max_attempts: int, window_seconds: int) -> None:
+    def __init__(self, max_attempts: int, window_seconds: int, max_keys: int = 10_000) -> None:
         self.max_attempts = max_attempts
         self.window = window_seconds
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self.max_keys = max_keys
+        self._hits: dict[str, deque[float]] = {}
+        self._access_order: deque[str] = deque()  # Track key access order for LRU eviction
         self._lock = threading.Lock()
+
+    def _evict_lru_if_needed(self) -> None:
+        """Evict least-recently-used keys when max_keys limit is reached."""
+        while len(self._hits) >= self.max_keys and self._access_order:
+            lru_key = self._access_order.popleft()
+            # Key might have been removed already or accessed again
+            if lru_key in self._hits:
+                # Only evict if this key is not at the end of access_order (not recently used)
+                # Check if any timestamps are still within the window
+                now = time.monotonic()
+                q = self._hits[lru_key]
+                while q and now - q[0] > self.window:
+                    q.popleft()
+                # Remove if empty or evict anyway to enforce limit
+                if not q or len(self._hits) >= self.max_keys:
+                    self._hits.pop(lru_key, None)
+
+    def _touch_key(self, key: str) -> None:
+        """Mark a key as recently accessed for LRU tracking."""
+        # Remove key from its current position if present
+        try:
+            self._access_order.remove(key)
+        except ValueError:
+            pass
+        # Add to end (most recently used)
+        self._access_order.append(key)
 
     def check(self, *keys: str) -> None:
         now = time.monotonic()
         with self._lock:
             for key in keys:
+                # Get or create the deque for this key
+                if key not in self._hits:
+                    self._evict_lru_if_needed()
+                    self._hits[key] = deque()
+                
                 q = self._hits[key]
+                self._touch_key(key)
+                
+                # Prune expired timestamps
                 while q and now - q[0] > self.window:
                     q.popleft()
-                if len(q) >= self.max_attempts:
+                
+                # Remove empty entries to free memory
+                if not q:
+                    self._hits.pop(key, None)
+                    try:
+                        self._access_order.remove(key)
+                    except ValueError:
+                        pass
+                elif len(q) >= self.max_attempts:
                     raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many attempts, try again later")
 
     def fail(self, *keys: str) -> None:
         now = time.monotonic()
         with self._lock:
             for key in keys:
+                if key not in self._hits:
+                    self._evict_lru_if_needed()
+                    self._hits[key] = deque()
                 self._hits[key].append(now)
+                self._touch_key(key)
 
     def reset(self, *keys: str) -> None:
         with self._lock:
             for key in keys:
                 self._hits.pop(key, None)
+                try:
+                    self._access_order.remove(key)
+                except ValueError:
+                    pass
 
 
 login_limiter = LoginRateLimiter(settings.login_max_attempts, settings.login_window_seconds)
